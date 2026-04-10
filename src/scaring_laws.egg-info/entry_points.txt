@@ -1,2 +1,0 @@
-[console_scripts]
-scaring-laws = scaring_laws.cli:main
