@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""
+Download a weighted Hugging Face pretraining mix as newline-delimited JSON.
+
+Default dataset:
+  balanced_web_edu_mix_10B
+
+Default weights:
+  C4: 35%
+  FineWeb-Edu: 30%
+  SlimPajama: 20%
+  OpenWebText2: 10%
+  Wikipedia / StackExchange / arXiv: 5% total, split equally
+
+The script writes one JSONL file per source under:
+  /datadisk_1/balanced_web_edu_mix_10B/jsonl/
+
+Each output line is:
+  {"text": "...", "source": "...", "source_repo": "..."}
+
+The target is approximate because it estimates tokens from characters unless a
+dataset exposes a token_count column.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import importlib
+import json
+import os
+import random
+import sys
+import tarfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Iterable
+from urllib.parse import quote
+
+
+HF_DATASET_BASE = "https://huggingface.co/datasets"
+DEFAULT_OUTPUT_DIR = Path("/datadisk_1/balanced_web_edu_mix_10B")
+
+
+@dataclass(frozen=True)
+class Source:
+    name: str
+    weight: float
+    repo: str
+    file_globs: tuple[str, ...]
+    loader: str
+    text_fields: tuple[str, ...]
+    max_files: int | None = None
+    shuffle_files: bool = True
+
+    @property
+    def url(self) -> str:
+        return f"{HF_DATASET_BASE}/{self.repo}"
+
+
+SOURCES: tuple[Source, ...] = (
+    Source(
+        name="c4",
+        weight=0.35,
+        repo="allenai/c4",
+        file_globs=("en/c4-train.*.json.gz",),
+        loader="json",
+        text_fields=("text",),
+    ),
+    Source(
+        name="fineweb_edu",
+        weight=0.30,
+        repo="HuggingFaceFW/fineweb-edu",
+        file_globs=("sample/10BT/*.parquet",),
+        loader="parquet",
+        text_fields=("text",),
+    ),
+    Source(
+        name="slimpajama",
+        weight=0.20,
+        repo="gmongaras/SlimPajama-627B_Reupload",
+        file_globs=("data/train-*.parquet",),
+        loader="parquet",
+        text_fields=("text",),
+    ),
+    Source(
+        name="openwebtext2",
+        weight=0.10,
+        repo="segyges/OpenWebText2",
+        file_globs=("openwebtext2.jsonl.zst.tar",),
+        loader="tar_zst_jsonl",
+        text_fields=("text", "txt", "json", "content"),
+        shuffle_files=False,
+    ),
+    Source(
+        name="wikipedia",
+        weight=0.05 / 3,
+        repo="wikimedia/wikipedia",
+        file_globs=("20231101.en/train-*.parquet",),
+        loader="parquet",
+        text_fields=("text",),
+    ),
+    Source(
+        name="stackexchange",
+        weight=0.05 / 3,
+        repo="HuggingFaceTB/stackexchange_2025_md",
+        file_globs=(
+            "stackoverflow.com/train-*.parquet",
+            "math.stackexchange.com/train-*.parquet",
+            "stats.stackexchange.com/train-*.parquet",
+            "superuser.com/train-*.parquet",
+            "serverfault.com/train-*.parquet",
+            "askubuntu.com/train-*.parquet",
+        ),
+        loader="parquet",
+        text_fields=("text", "markdown", "content", "body"),
+    ),
+    Source(
+        name="arxiv",
+        weight=0.05 / 3,
+        repo="ccdv/arxiv-summarization",
+        file_globs=("document/train-*.parquet",),
+        loader="parquet",
+        text_fields=("article", "text"),
+    ),
+)
+
+
+def import_or_exit(module_name: str, install_hint: str) -> Any:
+    try:
+        return importlib.import_module(module_name)
+    except ImportError:
+        print(f"ERROR: missing Python package '{module_name}'. Install with: {install_hint}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+def matches_any(path: str, patterns: tuple[str, ...]) -> bool:
+    from fnmatch import fnmatch
+
+    return any(fnmatch(path, pattern) for pattern in patterns)
+
+
+def hf_file_url(repo: str, path: str, revision: str) -> str:
+    quoted_path = "/".join(quote(part) for part in path.split("/"))
+    return f"{HF_DATASET_BASE}/{repo}/resolve/{quote(revision)}/{quoted_path}"
+
+
+def list_matching_files(source: Source, revision: str, seed: int) -> list[str]:
+    huggingface_hub = import_or_exit("huggingface_hub", "python -m pip install huggingface_hub")
+    api = huggingface_hub.HfApi()
+    files = api.list_repo_files(source.repo, repo_type="dataset", revision=revision)
+    matches = [path for path in files if matches_any(path, source.file_globs)]
+    if source.shuffle_files:
+        source_seed = int(hashlib.sha256(source.name.encode("utf-8")).hexdigest()[:8], 16)
+        random.Random(seed + source_seed).shuffle(matches)
+    else:
+        matches.sort()
+    if source.max_files is not None:
+        matches = matches[: source.max_files]
+    return matches
+
+
+def download_repo_file(source: Source, file_path: str, revision: str, cache_dir: Path) -> str:
+    huggingface_hub = import_or_exit("huggingface_hub", "python -m pip install huggingface_hub")
+    return huggingface_hub.hf_hub_download(
+        repo_id=source.repo,
+        filename=file_path,
+        repo_type="dataset",
+        revision=revision,
+        cache_dir=str(cache_dir),
+        resume_download=True,
+    )
+
+
+def load_stream(source: Source, files: list[str], revision: str) -> Iterable[dict[str, Any]]:
+    datasets = import_or_exit("datasets", "python -m pip install datasets pyarrow")
+    urls = [hf_file_url(source.repo, path, revision) for path in files]
+    data_files = {"train": urls}
+    return datasets.load_dataset(source.loader, data_files=data_files, split="train", streaming=True)
+
+
+def load_local_stream(source: Source, local_file: str) -> Iterable[dict[str, Any]]:
+    if source.loader == "tar_zst_jsonl":
+        yield from load_tar_zst_jsonl(local_file)
+        return
+    if source.loader == "parquet":
+        yield from load_local_parquet(local_file)
+        return
+
+    datasets = import_or_exit("datasets", "python -m pip install datasets pyarrow")
+    data_files = {"train": [local_file]}
+    return datasets.load_dataset(source.loader, data_files=data_files, split="train", streaming=True)
+
+
+def load_local_parquet(local_file: str, batch_size: int = 4096) -> Iterable[dict[str, Any]]:
+    pyarrow_parquet = import_or_exit("pyarrow.parquet", "python -m pip install pyarrow")
+    parquet_file = pyarrow_parquet.ParquetFile(local_file)
+    for batch in parquet_file.iter_batches(batch_size=batch_size):
+        for row in batch.to_pylist():
+            yield row
+
+
+def load_tar_zst_jsonl(local_file: str) -> Iterable[dict[str, Any]]:
+    zstandard = import_or_exit("zstandard", "python -m pip install zstandard")
+    dctx = zstandard.ZstdDecompressor()
+
+    with tarfile.open(local_file, mode="r:") as archive:
+        for member in archive:
+            if not member.isfile() or not member.name.endswith(".jsonl.zst"):
+                continue
+            compressed = archive.extractfile(member)
+            if compressed is None:
+                continue
+            with dctx.stream_reader(compressed) as reader:
+                buffer = b""
+                while True:
+                    chunk = reader.read(1 << 20)
+                    if not chunk:
+                        break
+                    buffer += chunk
+                    lines = buffer.split(b"\n")
+                    buffer = lines.pop()
+                    for line in lines:
+                        if not line.strip():
+                            continue
+                        try:
+                            yield json.loads(line)
+                        except json.JSONDecodeError:
+                            yield {"text": line.decode("utf-8", errors="ignore")}
+                if buffer.strip():
+                    try:
+                        yield json.loads(buffer)
+                    except json.JSONDecodeError:
+                        yield {"text": buffer.decode("utf-8", errors="ignore")}
+
+
+def normalize_text(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="ignore")
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                parsed = json.loads(stripped)
+            except json.JSONDecodeError:
+                return stripped
+            return extract_text(parsed, ("text", "txt", "article", "content", "body"))
+        return stripped
+    if isinstance(value, dict):
+        return extract_text(value, ("text", "txt", "article", "content", "body"))
+    if isinstance(value, list):
+        parts = [normalize_text(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    return str(value).strip()
+
+
+def extract_text(example: dict[str, Any], fields: tuple[str, ...]) -> str:
+    for field in fields:
+        if field in example:
+            text = normalize_text(example[field])
+            if text:
+                return text
+
+    string_values = [normalize_text(value) for value in example.values() if isinstance(value, (str, bytes))]
+    string_values = [value for value in string_values if value]
+    if not string_values:
+        return ""
+    return max(string_values, key=len)
+
+
+def estimate_tokens(example: dict[str, Any], text: str, chars_per_token: float) -> int:
+    for key in ("token_count", "tokens", "num_tokens"):
+        value = example.get(key)
+        if isinstance(value, int) and value > 0:
+            return value
+    return max(1, int(len(text) / chars_per_token))
+
+
+def write_source(
+    source: Source,
+    output_dir: Path,
+    revision: str,
+    target_tokens: int,
+    chars_per_token: float,
+    min_chars: int,
+    seed: int,
+    max_retries: int,
+    force_overwrite: bool,
+    dry_run: bool,
+) -> dict[str, Any]:
+    files = list_matching_files(source, revision=revision, seed=seed)
+    selected_urls = [hf_file_url(source.repo, path, revision) for path in files[:5]]
+    source_target = int(target_tokens * source.weight)
+
+    summary: dict[str, Any] = {
+        "name": source.name,
+        "weight": source.weight,
+        "target_tokens": source_target,
+        "repo": source.repo,
+        "url": source.url,
+        "loader": source.loader,
+        "file_patterns": list(source.file_globs),
+        "matched_files": len(files),
+        "example_file_urls": selected_urls,
+        "written_docs": 0,
+        "written_tokens_est": 0,
+        "output_file": str(output_dir / "jsonl" / f"{source.name}.jsonl"),
+        "failed_files": [],
+    }
+
+    if not files:
+        raise RuntimeError(f"No files matched {source.repo}: {source.file_globs}")
+    if dry_run:
+        return summary
+
+    jsonl_dir = output_dir / "jsonl"
+    cache_dir = output_dir / "hf_home" / "hub"
+    jsonl_dir.mkdir(parents=True, exist_ok=True)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    output_path = jsonl_dir / f"{source.name}.jsonl"
+    partial_path = output_path.with_suffix(".jsonl.tmp")
+
+    if output_path.exists() and output_path.stat().st_size > 0 and not force_overwrite:
+        print(f"\n[{source.name}] existing non-empty output found, skipping: {output_path}")
+        summary["skipped_existing"] = True
+        summary["existing_bytes"] = output_path.stat().st_size
+        return summary
+
+    print(f"\n[{source.name}] {source.url}")
+    print(f"  matched files: {len(files):,}")
+    print(f"  target tokens: {source_target:,}")
+    print(f"  output: {output_path}")
+
+    written_docs = 0
+    written_tokens = 0
+    skipped = 0
+    start = time.time()
+    log_every_tokens = max(100_000, source_target // 100)
+
+    with partial_path.open("w", encoding="utf-8") as handle:
+        next_log = log_every_tokens
+        for file_index, file_path in enumerate(files, start=1):
+            file_done = False
+            for attempt in range(1, max_retries + 1):
+                try:
+                    local_file = download_repo_file(source, file_path, revision=revision, cache_dir=cache_dir)
+                    stream = load_local_stream(source, local_file)
+                    for example in stream:
+                        text = extract_text(example, source.text_fields)
+                        if len(text) < min_chars:
+                            skipped += 1
+                            continue
+
+                        doc_tokens = estimate_tokens(example, text, chars_per_token)
+                        row = {"text": text, "source": source.name, "source_repo": source.repo}
+                        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+                        written_docs += 1
+                        written_tokens += doc_tokens
+
+                        if written_tokens >= next_log:
+                            elapsed = max(1e-6, time.time() - start)
+                            rate = written_tokens / elapsed
+                            remaining = max(0, source_target - written_tokens) / max(rate, 1e-6)
+                            pct = min(100.0, written_tokens / source_target * 100)
+                            print(
+                                f"  {pct:5.1f}% | {written_tokens:,}/{source_target:,} tokens "
+                                f"| {written_docs:,} docs | file {file_index:,}/{len(files):,} "
+                                f"| {rate:,.0f} tok/s | ETA {format_seconds(remaining)}"
+                            )
+                            next_log += log_every_tokens
+
+                        if written_tokens >= source_target:
+                            break
+                    file_done = True
+                    break
+                except Exception as exc:
+                    print(f"  WARN: {file_path} failed on attempt {attempt}/{max_retries}: {exc}")
+                    time.sleep(min(30, 2**attempt))
+
+            if not file_done:
+                summary["failed_files"].append(file_path)
+            if written_tokens >= source_target:
+                break
+
+    partial_path.replace(output_path)
+    summary["written_docs"] = written_docs
+    summary["written_tokens_est"] = written_tokens
+    summary["skipped_docs"] = skipped
+    summary["elapsed_seconds"] = round(time.time() - start, 3)
+    if written_tokens < source_target:
+        raise RuntimeError(
+            f"{source.name} only wrote {written_tokens:,}/{source_target:,} estimated tokens. "
+            f"Failed files: {len(summary['failed_files'])}"
+        )
+    return summary
+
+
+def format_seconds(seconds: float) -> str:
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    if seconds < 3600:
+        return f"{seconds / 60:.1f}m"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h{minutes:02d}m"
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--dataset-name", default="balanced_web_edu_mix_10B")
+    parser.add_argument("--target-tokens", type=int, default=10_000_000_000)
+    parser.add_argument("--chars-per-token", type=float, default=4.0)
+    parser.add_argument("--min-chars", type=int, default=100)
+    parser.add_argument("--revision", default="main")
+    parser.add_argument("--seed", type=int, default=1234)
+    parser.add_argument("--max-retries", type=int, default=3)
+    parser.add_argument("--force-overwrite", action="store_true")
+    parser.add_argument("--only", nargs="*", choices=[source.name for source in SOURCES])
+    parser.add_argument("--dry-run", action="store_true")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    os.environ.setdefault("HF_HOME", str(args.output_dir / "hf_home"))
+    os.environ.setdefault("HF_DATASETS_CACHE", str(args.output_dir / "hf_home" / "datasets"))
+
+    selected = [source for source in SOURCES if not args.only or source.name in args.only]
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+
+    manifest = {
+        "dataset_name": args.dataset_name,
+        "target_tokens": args.target_tokens,
+        "chars_per_token": args.chars_per_token,
+        "min_chars": args.min_chars,
+        "revision": args.revision,
+        "hf_home": os.environ["HF_HOME"],
+        "hf_datasets_cache": os.environ["HF_DATASETS_CACHE"],
+        "sources": [],
+    }
+
+    print(f"Dataset: {args.dataset_name}")
+    print(f"Output: {args.output_dir}")
+    print(f"Target tokens: {args.target_tokens:,}")
+    print(f"Dry run: {args.dry_run}")
+
+    for source in selected:
+        summary = write_source(
+            source=source,
+            output_dir=args.output_dir,
+            revision=args.revision,
+            target_tokens=args.target_tokens,
+            chars_per_token=args.chars_per_token,
+            min_chars=args.min_chars,
+            seed=args.seed,
+            max_retries=args.max_retries,
+            force_overwrite=args.force_overwrite,
+            dry_run=args.dry_run,
+        )
+        manifest["sources"].append(summary)
+
+    manifest_path = args.output_dir / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    print(f"\nWrote manifest: {manifest_path}")
+
+
+if __name__ == "__main__":
+    main()
