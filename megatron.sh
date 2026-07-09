@@ -1,4 +1,3 @@
-cat > /root/check_fix_megatron_env.sh <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 
@@ -465,4 +464,4 @@ echo
 echo "==== DONE ===="
 echo "Megatron path:"
 echo "${MEGATRON_DIR}"
-BASH
+
