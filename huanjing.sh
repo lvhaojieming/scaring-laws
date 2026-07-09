@@ -19,3 +19,7 @@ npm install -g @openai/codex
 # 检查
 which codex
 codex --version
+
+codex \
+  --sandbox danger-full-access \
+  --ask-for-approval never
