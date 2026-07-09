@@ -15,15 +15,18 @@ CHECKPOINT_DIR="${CHECKPOINT_DIR:-${CHECKPOINT_ROOT}/${RUN_NAME}}"
 RUN_ROOT="${RUN_ROOT:-/datadisk_1/megatron_pretrain_runs/${RUN_NAME}}"
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${RUN_ROOT}/tensorboard}"
 DATA_CACHE_DIR="${DATA_CACHE_DIR:-${RUN_ROOT}/data_cache}"
-LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
-WANDB_DIR="${WANDB_DIR:-/datadisk_1/wandb}"
+LOG_DIR="${LOG_DIR:-/root/pretrain_logs/${RUN_NAME}}"
+WANDB_DIR="${WANDB_DIR:-/root/wandb_logs}"
+WANDB_MODE="${WANDB_MODE:-online}"
 
 mkdir -p "${CHECKPOINT_DIR}" "${TENSORBOARD_DIR}" "${DATA_CACHE_DIR}" "${LOG_DIR}" "${WANDB_DIR}"
 
 export CUDA_DEVICE_MAX_CONNECTIONS="${CUDA_DEVICE_MAX_CONNECTIONS:-1}"
 export TOKENIZERS_PARALLELISM="${TOKENIZERS_PARALLELISM:-false}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 export PYTHON="${PYTHON:-/usr/bin/python}"
 export WANDB_DIR
+export WANDB_MODE
 
 MASTER_ADDR="${MASTER_ADDR:-localhost}"
 MASTER_PORT="${MASTER_PORT:-6000}"
@@ -36,7 +39,7 @@ TP_SIZE="${TP_SIZE:-1}"
 PP_SIZE="${PP_SIZE:-1}"
 DP_SIZE="${DP_SIZE:-2}"
 
-MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-16}"
+MICRO_BATCH_SIZE="${MICRO_BATCH_SIZE:-4}"
 GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-256}"
 SEQ_LENGTH="${SEQ_LENGTH:-2048}"
 TRAIN_ITERS="${TRAIN_ITERS:-9537}"
@@ -46,12 +49,15 @@ SAVE_INTERVAL="${SAVE_INTERVAL:-100}"
 EVAL_INTERVAL="${EVAL_INTERVAL:-250}"
 EVAL_ITERS="${EVAL_ITERS:-20}"
 LOG_INTERVAL="${LOG_INTERVAL:-10}"
+ATTENTION_BACKEND="${ATTENTION_BACKEND:-flash}"
+RECOMPUTE_GRANULARITY="${RECOMPUTE_GRANULARITY:-selective}"
 KEEP_TOKEN_MILESTONES="${KEEP_TOKEN_MILESTONES:-1000000000 3000000000 5000000000}"
 CHECKPOINT_PRUNE_INTERVAL_SECONDS="${CHECKPOINT_PRUNE_INTERVAL_SECONDS:-60}"
 CHECKPOINT_PRUNE_GRACE_SECONDS="${CHECKPOINT_PRUNE_GRACE_SECONDS:-1800}"
 
-WANDB_PROJECT="${WANDB_PROJECT:-balanced_web_edu_mix_10B}"
-WANDB_EXP_NAME="${WANDB_EXP_NAME:-${RUN_NAME}}"
+WANDB_PROJECT="${WANDB_PROJECT:-width-scaling-5btoken}"
+WANDB_NAME="${WANDB_NAME:-gpt-w2048-l32-h2048-5btok}"
+WANDB_EXP_NAME="${WANDB_EXP_NAME:-${WANDB_NAME}}"
 WANDB_ENTITY="${WANDB_ENTITY:-}"
 
 RUN_TRAIN="${RUN_TRAIN:-0}"
@@ -100,6 +106,12 @@ fi
 
 if [[ "${WORLD_SIZE}" -ne $((TP_SIZE * PP_SIZE * DP_SIZE)) ]]; then
   echo "Invalid parallelism: WORLD_SIZE=${WORLD_SIZE}, but TP*PP*DP=$((TP_SIZE * PP_SIZE * DP_SIZE))." >&2
+  exit 1
+fi
+
+if [[ $((GLOBAL_BATCH_SIZE % (MICRO_BATCH_SIZE * DP_SIZE))) -ne 0 ]]; then
+  echo "Invalid batch sizes: GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must be divisible by MICRO_BATCH_SIZE*DP_SIZE=$((MICRO_BATCH_SIZE * DP_SIZE))." >&2
+  echo "For GLOBAL_BATCH_SIZE=256 and DP_SIZE=${DP_SIZE}, use MICRO_BATCH_SIZE values such as 4, 8, 16, or 32." >&2
   exit 1
 fi
 
@@ -201,6 +213,8 @@ MODEL_ARGS=(
   --rotary-base 500000
   --rotary-percent 1.0
   --use-rope-scaling
+  --transformer-impl transformer_engine
+  --attention-backend "${ATTENTION_BACKEND}"
   --attention-dropout 0.0
   --hidden-dropout 0.0
   --swiglu
@@ -235,10 +249,15 @@ TRAINING_ARGS=(
   --bf16
   --grad-reduce-in-bf16
   --cross-entropy-loss-fusion
+  --cross-entropy-fusion-impl native
   --calculate-per-token-loss
   --manual-gc
   --empty-unused-memory-level 1
 )
+
+if [[ "${RECOMPUTE_GRANULARITY}" != "none" ]]; then
+  TRAINING_ARGS+=(--recompute-granularity "${RECOMPUTE_GRANULARITY}")
+fi
 
 DATA_ARGS=(
   --data-path "${data_path[@]}"
@@ -289,6 +308,8 @@ Requested GPUs: ${GPUS_PER_NODE}
 Parallelism: TP=${TP_SIZE}, PP=${PP_SIZE}, DP=${DP_SIZE}
 Micro/global batch: ${MICRO_BATCH_SIZE}/${GLOBAL_BATCH_SIZE}
 Sequence length: ${SEQ_LENGTH}
+Attention backend: ${ATTENTION_BACKEND}
+Recompute granularity: ${RECOMPUTE_GRANULARITY}
 Tokens per iteration: $((GLOBAL_BATCH_SIZE * SEQ_LENGTH))
 Train iterations: ${TRAIN_ITERS}
 Target tokens: $((GLOBAL_BATCH_SIZE * SEQ_LENGTH * TRAIN_ITERS))
