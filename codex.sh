@@ -23,3 +23,16 @@ codex --version
 codex \
   --sandbox danger-full-access \
   --ask-for-approval never
+
+
+HTTP_PROXY=http://127.0.0.1:17890 \
+HTTPS_PROXY=http://127.0.0.1:17890 \
+ALL_PROXY=http://127.0.0.1:17890 \
+http_proxy=http://127.0.0.1:17890 \
+https_proxy=http://127.0.0.1:17890 \
+all_proxy=http://127.0.0.1:17890 \
+NO_PROXY=localhost,127.0.0.1,::1 \
+no_proxy=localhost,127.0.0.1,::1 \
+codex --no-daemon \
+  -c features.respect_system_proxy=true \
+  --yolo
